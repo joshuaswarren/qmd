@@ -1585,3 +1585,7 @@ Used for generating query variations via `LlamaChatSession`.
 ## License
 
 MIT
+
+## Contributors
+
+Everyone credited so far: [CONTRIBUTORS.md](CONTRIBUTORS.md).
