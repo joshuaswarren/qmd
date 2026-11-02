@@ -444,18 +444,13 @@ class MalformedLinkTests(unittest.TestCase):
         self.assertIsNone(uc._next_link('https://x?page=2> ; rel="next"'))
 
 
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-if __name__ == "__main__":
-    unittest.main()
-
-
-
-
+class GuardOrderTests(unittest.TestCase):
+    def test_all_classes_precede_main_guard(self):
+        import test_update_contributors as self_module
+        lines = open(self_module.__file__, encoding="utf-8").read().split("\n")
+        guard_at = next(i for i, l in enumerate(lines) if l.startswith("if __name__"))
+        classes_after = [l for l in lines[guard_at + 1:] if l.startswith("class ")]
+        self.assertEqual(classes_after, [])
 
 
 if __name__ == "__main__":
