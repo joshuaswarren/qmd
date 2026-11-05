@@ -891,6 +891,7 @@ describe("CLI Status Command", () => {
       QMD_DOCTOR_DEVICE_PROBE: "0",
       QMD_FORCE_CPU: "1",
       QMD_LLAMA_GPU: "metal",
+      QMD_VRAM_PADDING_MB: "256",
       QMD_EMBED_PARALLELISM: "2",
       QMD_EXPAND_CONTEXT_SIZE: "4096",
       QMD_RERANK_CONTEXT_SIZE: "8192",
@@ -915,6 +916,7 @@ describe("CLI Status Command", () => {
       expect(stdout).toContain(name);
     }
     expect(stdout).toContain("forces llama.cpp to bypass GPU backends");
+    expect(stdout).toContain("overrides llama.cpp's default VRAM padding in MiB");
     expect(stdout).toContain("moves the default index cache");
     expect(stdout).toContain("disables real LLM operations");
     expect(stdout).toContain("changes Hugging Face download endpoint");

@@ -783,6 +783,17 @@ export function resolveLlamaGpuMode(
   return "auto";
 }
 
+function resolveVramPadding(): number | undefined {
+  const value = process.env.QMD_VRAM_PADDING_MB?.trim();
+  if (!value) return undefined;
+
+  const padding = Number(value) * 1024 * 1024;
+  if (!Number.isFinite(padding) || padding < 0) {
+    process.stderr.write("QMD Warning: invalid QMD_VRAM_PADDING_MB; using node-llama-cpp's default VRAM padding.\n");
+    return undefined;
+  }
+  return padding;
+}
 
 /** node-llama-cpp 3.20 made LlamaContextSequence.dispose() async (llama.cpp b10361).
  * Context.onDispose fires sequence.dispose() without awaiting, so dispose the
@@ -1036,6 +1047,7 @@ export class LlamaCpp implements LLM {
       const canBuild = allowBuild && canWriteLlamaDir();
 
       const { getLlama, getLlamaGpuTypes, LlamaLogLevel } = await loadNodeLlamaCpp();
+      const vramPadding = resolveVramPadding();
       const loadLlama = async (gpu: LlamaGpuMode, sourceBuildAllowed = canBuild, buildOverride?: "auto" | "never") =>
         await withNativeStdoutRedirectedToStderr(() => getLlama({
           // Prefer packaged prebuilt bindings before compiling llama.cpp locally.
@@ -1046,6 +1058,7 @@ export class LlamaCpp implements LLM {
           build: buildOverride ?? (sourceBuildAllowed ? "auto" : "never"),
           logLevel: LlamaLogLevel.error,
           gpu,
+          ...(vramPadding !== undefined ? { vramPadding } : {}),
           progressLogs: false,
           skipDownload: !sourceBuildAllowed,
         }));

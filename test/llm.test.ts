@@ -409,6 +409,65 @@ describe("native llama stdout containment", () => {
     }
   });
 
+  test("forwards QMD_VRAM_PADDING_MB as bytes while preserving runtime choices and defaults", async () => {
+    const previous = {
+      gpu: process.env.QMD_LLAMA_GPU,
+      padding: process.env.QMD_VRAM_PADDING_MB,
+      forceCpu: process.env.QMD_FORCE_CPU,
+    };
+    process.env.QMD_LLAMA_GPU = "cuda";
+    delete process.env.QMD_FORCE_CPU;
+    const options: Record<string, unknown>[] = [];
+    const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+    setNodeLlamaCppModuleForTest({
+      LlamaLogLevel: { error: "error" },
+      resolveModelFile: vi.fn(),
+      LlamaChatSession: class { prompt = async () => ""; },
+      getLlama: vi.fn(async (value: Record<string, unknown>) => {
+        options.push(value);
+        return { gpu: "cuda", cpuMathCores: 4, dispose: vi.fn(async () => {}) } as any;
+      }),
+    });
+    try {
+      const cases = [
+        { value: "256", expected: 256 * 1024 * 1024 },
+        { value: "0", expected: 0 },
+        { value: "-1" },
+        { value: "Infinity" },
+        { value: "1e308" },
+        { value: undefined },
+      ];
+      for (const { value, expected } of cases) {
+        if (value === undefined) delete process.env.QMD_VRAM_PADDING_MB;
+        else process.env.QMD_VRAM_PADDING_MB = value;
+        const llm = new LlamaCpp({
+          embedModel: "embed-choice",
+          generateModel: "generate-choice",
+          rerankModel: "rerank-choice",
+        });
+        await (llm as any).ensureLlama();
+        const runtimeOptions = options.at(-1)!;
+        expect(runtimeOptions.gpu).toBe("cuda");
+        if (expected === undefined) expect(runtimeOptions).not.toHaveProperty("vramPadding");
+        else expect(runtimeOptions.vramPadding).toBe(expected);
+        expect(llm.embedModelName).toBe("embed-choice");
+        expect(llm.generateModelName).toBe("generate-choice");
+        expect(llm.rerankModelName).toBe("rerank-choice");
+        await llm.dispose();
+      }
+      expect(String(stderr.mock.calls.map(call => call[0]).join(""))).not.toMatch(/-1|Infinity|1e308/);
+    } finally {
+      stderr.mockRestore();
+      setNodeLlamaCppModuleForTest(null);
+      if (previous.gpu === undefined) delete process.env.QMD_LLAMA_GPU;
+      else process.env.QMD_LLAMA_GPU = previous.gpu;
+      if (previous.padding === undefined) delete process.env.QMD_VRAM_PADDING_MB;
+      else process.env.QMD_VRAM_PADDING_MB = previous.padding;
+      if (previous.forceCpu === undefined) delete process.env.QMD_FORCE_CPU;
+      else process.env.QMD_FORCE_CPU = previous.forceCpu;
+    }
+  });
+
   test("keeps native GPU failure noise off stdout and caches failed GPU init", async () => {
     const prevGpu = process.env.QMD_LLAMA_GPU;
     const prevForceCpu = process.env.QMD_FORCE_CPU;
