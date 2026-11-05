@@ -54,7 +54,9 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # shortcut: Bun 1.4.4 disables SQLite heap limits; upgrade when enforcement returns.
+          # https://bun.com/blog/bun-v1.4.4#bun-sqlite
+          bun-version: 1.4.3
 
       - name: Install SQLite (Ubuntu)
         if: runner.os == 'Linux'
