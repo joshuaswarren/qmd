@@ -69,9 +69,12 @@ import {
 import {
   LlamaCpp,
   builtinModels,
+  withLLMSessionForLlm,
 } from "./llm.js";
 import { resolveRemoteRerankConfig } from "./remote-rerank.js";
 import { snapshotFromConfig, snapshotIsTrusted } from "./trust.js";
+export { RemoteEmbedder } from "./remote-embed.js";
+export type { RemoteEmbedOptions } from "./remote-embed.js";
 import type {
   DocumentMetadata,
   MetadataScalar,
@@ -261,6 +264,7 @@ export interface LexSearchOptions {
  * Options for searchVector() — vector similarity search.
  */
 export interface VectorSearchOptions {
+  signal?: AbortSignal;
   limit?: number;
   collection?: string | string[];
   /** Metadata filter — every returned result satisfies it */
@@ -394,6 +398,7 @@ export interface QMDStore {
 
   /** Generate vector embeddings for documents that need them */
   embed(options?: {
+    signal?: AbortSignal;
     force?: boolean;
     model?: string;
     /** Restrict embedding to documents in one collection. */
@@ -451,25 +456,19 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     throw new Error("Provide either configPath or config, not both");
   }
 
-  // Create the internal store (opens DB, creates tables)
-  const internal = createStoreInternal(options.dbPath);
-  const db = internal.db;
-
   // Track whether we have a YAML config path for write-through
   const hasYamlConfig = !!options.configPath;
 
-  // Sync config into SQLite store_collections
+  // Resolve and validate model selection before opening SQLite.
   let config: CollectionConfig | undefined;
   if (options.configPath) {
-    // YAML mode: inject config source for write-through, sync to DB
+    // YAML mode: inject config source for write-through.
     setConfigSource({ configPath: options.configPath });
     config = loadConfig();
-    syncConfigToDb(db, config);
   } else if (options.config) {
-    // Inline config mode: inject config source for mutations, sync to DB
+    // Inline config mode: inject config source for mutations.
     setConfigSource({ config: options.config });
     config = options.config;
-    syncConfigToDb(db, config);
   }
   // else: DB-only mode — no external config, use existing store_collections
 
@@ -485,12 +484,16 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       : false;
   const llm = new LlamaCpp({
     embedModel: config?.models?.embed,
+    embedOptions: config?.models?.embedOptions,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
     remoteRerank: resolveRemoteRerankConfig(config?.models, { trusted: remoteRerankTrusted }),
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
+  const internal = createStoreInternal(options.dbPath);
+  const db = internal.db;
+  if (config) syncConfigToDb(db, config);
   internal.llm = llm;
 
   const store: QMDStore = {
@@ -547,7 +550,9 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     },
     searchVector: async (q, opts) => {
       const filter = opts?.filter === undefined ? undefined : parseMetadataFilter(opts.filter);
-      return internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, undefined, undefined, filter);
+      return withLLMSessionForLlm(llm, session =>
+        internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection, session, undefined, filter),
+        { signal: opts?.signal, name: "searchVector" });
     },
     expandQuery: async (q) => internal.expandQuery(q),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
@@ -663,6 +668,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     embed: async (embedOpts) => {
       return generateEmbeddings(internal, {
+        signal: embedOpts?.signal,
         force: embedOpts?.force,
         model: embedOpts?.model,
         collection: embedOpts?.collection,

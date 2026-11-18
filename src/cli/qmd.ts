@@ -107,6 +107,7 @@ import { formatMetadataKeySummaries, formatMetadataOverview } from "../metadata-
 import type { DocumentMetadata } from "../metadata.js";
 import { parseMetadataFilter, parseMetadataMatch, type MetadataFilter, type MetadataMatch } from "../metadata-filter.js";
 import { hasVectorIndex, storedEmbedding } from "../vec-layout.js";
+import { RemoteEmbedder, isRemoteEmbedModel } from "../remote-embed.js";
 import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, builtinModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import { resolveRemoteRerankConfig } from "../remote-rerank.js";
 import {
@@ -174,28 +175,34 @@ let currentIndexName = "index";
 
 function getStore(): ReturnType<typeof createStore> {
   if (!store) {
-    store = createStore(storeDbPathOverride);
-    // Sync YAML config into SQLite store_collections so store.ts reads from DB
+    const activeModels = ensureModelsConfiguredForCli();
+    let config: CollectionConfig;
     try {
-      const activeModels = ensureModelsConfiguredForCli();
-      const config = loadConfig();
-      syncConfigToDb(store.db, config);
-      // Untrusted project-local custom model URIs must not be loaded; status
-      // still displays the YAML values via resolveModelsForCli (#889).
-      // Remote rerank endpoints follow the same gate: an untrusted local
-      // config's rerank_api_* fields are ignored (#705 exfiltration fix).
-      const modelsForLlm = localConfigIsFullyTrusted() ? activeModels : resolveModels();
-      const llm = new LlamaCpp({
-        embedModel: modelsForLlm.embed,
-        generateModel: modelsForLlm.generate,
-        rerankModel: modelsForLlm.rerank,
-        remoteRerank: resolveRemoteRerankConfig(config.models, { trusted: localConfigIsFullyTrusted() }),
-      });
-      setDefaultLlamaCpp(llm);
-      store.llm = llm;
+      config = loadConfig();
     } catch {
-      // Config may not exist yet — that's fine, DB works without it
+      // Keep diagnostics available for invalid YAML. Valid but unsafe remote
+      // selections already failed above, outside this parse-only catch.
+      store = createStore(storeDbPathOverride);
+      return store;
     }
+    // Untrusted project-local custom model URIs/options must not be loaded;
+    // status still displays the YAML values via resolveModelsForCli (#889).
+    // Remote rerank endpoints follow the same gate: an untrusted local
+    // config's rerank_api_* fields are ignored (#705 exfiltration fix).
+    const trusted = localConfigIsFullyTrusted();
+    const modelsForLlm = trusted ? activeModels : resolveModels();
+    const llm = new LlamaCpp({
+      embedModel: modelsForLlm.embed,
+      embedOptions: trusted ? config.models?.embedOptions : undefined,
+      generateModel: modelsForLlm.generate,
+      rerankModel: modelsForLlm.rerank,
+      remoteRerank: resolveRemoteRerankConfig(config.models, { trusted }),
+    });
+    store = createStore(storeDbPathOverride);
+    // Sync YAML config into SQLite store_collections so store.ts reads from DB.
+    syncConfigToDb(store.db, config);
+    setDefaultLlamaCpp(llm);
+    store.llm = llm;
   }
   return store;
 }
@@ -694,7 +701,7 @@ async function showStatus(): Promise<void> {
     };
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
-    console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
+    console.log(`  Embedding:   ${isRemoteEmbedModel(activeModels.embed) ? "configured remote (not probed; no local download)" : hfLink(activeModels.embed)}`);
     console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
@@ -781,6 +788,9 @@ async function confirmOnTty(question: string): Promise<boolean> {
 }
 
 function printGatedItems(gated: GatedItems): void {
+  if (gated.embedOptions !== undefined) {
+    console.log(`${c.yellow}Custom remote embedding options (dimensions/revision/credential variable name)${c.reset}`);
+  }
   if (gated.hooks.length > 0) {
     console.log(`${c.yellow}This project's config defines update commands:${c.reset}`);
     for (const hook of gated.hooks) {
@@ -2321,29 +2331,34 @@ function parseEmbedTimeoutOption(value: unknown): number | undefined {
 }
 
 function ensureModelsConfiguredForCli(): { embed: string; generate: string; rerank: string } {
+  let config: CollectionConfig;
   try {
-    const config = loadConfig();
-    const models = resolveModels(config.models);
-    const current = config.models ?? {};
-    if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
-      saveConfig({
-        ...config,
-        models: {
-          ...current,
-          embed: models.embed,
-          generate: models.generate,
-          rerank: models.rerank,
-        },
-      });
-    }
-    return models;
+    config = loadConfig();
   } catch {
-    return resolveModels();
+    return resolveModels(); // Doctor reports the parse error without loading ML.
   }
+  const models = resolveModels(config.models);
+  const current = config.models ?? {};
+  // Invalid remote selection must fail closed, never fall back to local ML.
+  if (isRemoteEmbedModel(models.embed)) new RemoteEmbedder(models.embed, current.embedOptions);
+  else if (current.embedOptions !== undefined) throw new Error("embedOptions requires a remote embedding URI");
+  if (current.embed !== models.embed || current.generate !== models.generate || current.rerank !== models.rerank) {
+    saveConfig({
+      ...config,
+      models: {
+        ...current,
+        embed: models.embed,
+        generate: models.generate,
+        rerank: models.rerank,
+      },
+    });
+  }
+  return models;
 }
 
 export function resolveEmbedModelForCli(): string {
-  return ensureModelsConfiguredForCli().embed;
+  const uri = ensureModelsConfiguredForCli().embed;
+  return isRemoteEmbedModel(uri) ? new RemoteEmbedder(uri, loadConfig().models?.embedOptions).modelName : uri;
 }
 
 export function resolveGenerateModelForCli(): string {
@@ -2373,6 +2388,7 @@ async function vectorIndex(
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+  if (isRemoteEmbedModel(model)) model = storeInstance.llm!.embedModelName;
 
   // Exclusive process lock — concurrent embeds race on vector_rows (#825)
   const embedLock = tryAcquireEmbedLock(embedLockPathForDb(getDbPath()));
@@ -4082,7 +4098,7 @@ function collectEnvironmentOverrides(activeModels: { embed: string; generate: st
     const consequence = configured && configured !== raw
       ? `set but ignored because index models.${key} is configured as ${configured}`
       : `sets the active ${key} model to ${active}; changes embedding/search semantics and may require \`qmd pull\` plus \`qmd embed\``;
-    overrides.push({ name, value: envValueForDisplay(raw), consequence });
+    overrides.push({ name, value: key === "embed" && isRemoteEmbedModel(raw) ? "<remote URI>" : envValueForDisplay(raw), consequence });
   };
 
   add("INDEX_PATH", "overrides the SQLite index path; QMD reads/writes a different database");
@@ -4166,7 +4182,8 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
     } else if (check.configured && check.configured !== check.defaultModel) {
       notes.push(`${check.role}: index ${check.configured} (default ${check.defaultModel}; might be ok)`);
     } else if (envValue && check.active !== envValue) {
-      notes.push(`${check.role}: ${check.envName} is set to ${envValue} but index config uses ${check.active}`);
+      const display = check.key === "embed" && isRemoteEmbedModel(envValue) ? "<remote URI>" : envValue;
+      notes.push(`${check.role}: ${check.envName} is set to ${display} but index config uses ${check.active}`);
     }
   }
 
@@ -4186,6 +4203,10 @@ function checkModelCache(activeModels: { embed: string; generate: string; rerank
   ] as const;
   const unique = new Map<string, string[]>();
   for (const [role, model] of models) {
+    if (role === "embedding" && isRemoteEmbedModel(model)) {
+      doctorCheck("embedding configuration", true, "configured remote (not probed; no local download)");
+      continue;
+    }
     unique.set(model, [...(unique.get(model) ?? []), role]);
   }
 
@@ -4423,7 +4444,8 @@ async function showDoctor(): Promise<void> {
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
-  const embedModel = activeModels.embed;
+  const embedModel = resolveEmbedModelForCli();
+  const remoteEmbed = isRemoteEmbedModel(activeModels.embed);
   const fingerprint = getEmbeddingFingerprint(embedModel);
   const nextSteps: string[] = [];
 
@@ -4454,10 +4476,13 @@ async function showDoctor(): Promise<void> {
   checkModelDefaults(activeModels, configModels);
   checkModelCache(activeModels, nextSteps);
 
-  await runDoctorDeviceChecks(nextSteps);
+  if (!remoteEmbed) await runDoctorDeviceChecks(nextSteps);
+  else doctorCheck("device probe", true, "skipped for remote embedding configuration");
 
   try {
-    const adoption = await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
+    const adoption = remoteEmbed
+      ? { checked: false, adopted: 0, reason: "remote embedding identities have no legacy local fingerprint" }
+      : await maybeAdoptLegacyEmbeddingFingerprint(storeInstance, embedModel);
     if (adoption.checked || adoption.adopted > 0) {
       doctorCheck("legacy fingerprint adoption", adoption.adopted > 0, adoption.adopted > 0 ? `adopted ${adoption.adopted} legacy chunks; ${adoption.reason}` : adoption.reason);
     }
@@ -4516,7 +4541,9 @@ async function showDoctor(): Promise<void> {
   }
 
   try {
-    const vectorSample = await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
+    const vectorSample = remoteEmbed
+      ? { ok: true, details: "not probed: remote embedding configuration (no HTTP request)" }
+      : await checkEmbeddingVectorSamples(db, embedModel, fingerprint);
     doctorCheck("embedding vector sample", vectorSample.ok, vectorSample.details);
     if (!vectorSample.ok) {
       nextSteps.push("Run `qmd embed --force` to rebuild existing vectors that no longer reproduce under the current embedding pipeline.");
@@ -4972,6 +4999,7 @@ if (isMain) {
         activeModels.generate,
         activeModels.rerank,
       ];
+      if (isRemoteEmbedModel(activeModels.embed)) console.log("Embedding: configured remote; no local download (not probed)");
       console.log(`${c.bold}Pulling models${c.reset}`);
       const results = await pullModels(models, {
         refresh,
