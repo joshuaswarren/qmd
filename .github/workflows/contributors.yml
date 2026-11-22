@@ -28,6 +28,12 @@ jobs:
       # One exclusion policy shared by regeneration and the --check pass so
       # the check can never validate under a different policy than wrote.
       EXTRA_EXCLUDE: ''
+      # The updater and its unit tests live in .github/scripts; without this
+      # Python writes .github/scripts/__pycache__/, which the single-file
+      # diff guard then reports as "files beyond CONTRIBUTORS.md" and the
+      # whole job fails after a clean run (measured: every run since the
+      # registry landed).
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       # Always regenerate against the default branch, even when a maintainer
       # picks another ref in workflow_dispatch (a dispatch against a feature
